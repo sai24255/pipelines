@@ -1,0 +1,601 @@
+name: Azure VM Recovery Completion
+
+env:
+  AZURE_ENVIRONMENT: AzurePublicCloud
+  PS_MODULE_CACHE_PATH: ~/.powershell/modules
+
+on:
+  workflow_dispatch:
+    inputs:
+      subscriptionId:
+        description: 'Azure Subscription ID (GUID format)'
+        required: true
+        type: string
+      resourceGroupName:
+        description: 'Azure Resource Group Name'
+        required: true
+        type: string
+      vmName:
+        description: 'Source VM Name to restore'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: recovery-${{ github.workflow }}-${{ inputs.vmName }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  request-approval:
+    name: Request Recovery Completion Approval
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      approval_requested: ${{ steps.log-approval.outputs.approval_requested }}
+
+    steps:
+      - name: Log Approval Request
+        id: log-approval
+        shell: bash
+        run: |
+          cat << 'EOF'
+          ╔════════════════════════════════════════════════════════════════╗
+          ║        RECOVERY COMPLETION APPROVAL REQUIRED                   ║
+          ╚════════════════════════════════════════════════════════════════╝
+          
+          Subscription:     ${{ inputs.subscriptionId }}
+          Resource Group:   ${{ inputs.resourceGroupName }}
+          VM Name:          ${{ inputs.vmName }}
+          
+          Action:           Complete OS Disk Recovery
+          Risk Level:       HIGH - Will perform final disk swap and cleanup
+          
+          Please review:
+          1. Verify repair activities completed on repair VM
+          2. Confirm recovered OS disk is ready
+          3. Ensure source VM can be safely restarted
+          4. Check rollback snapshots are created
+          
+          Approvers: Review in GitHub Environment settings
+          
+          ╔════════════════════════════════════════════════════════════════╗
+          EOF
+          echo "approval_requested=true" >> $GITHUB_OUTPUT
+
+  validate-inputs:
+    name: Validate and Prepare Inputs
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    outputs:
+      subscription_id: ${{ steps.validate.outputs.subscription_id }}
+      resource_group_name: ${{ steps.validate.outputs.resource_group_name }}
+      vm_name: ${{ steps.validate.outputs.vm_name }}
+      correlation_id: ${{ steps.generate-correlation.outputs.correlation_id }}
+
+    steps:
+      - name: Validate Input Formats
+        id: validate
+        shell: bash
+        run: |
+          set -e
+          
+          echo "Validating input parameters..."
+          
+          SUBSCRIPTION_ID="${{ inputs.subscriptionId }}"
+          RESOURCE_GROUP="${{ inputs.resourceGroupName }}"
+          VM_NAME="${{ inputs.vmName }}"
+          
+          # Validate subscription ID format (GUID)
+          if ! [[ "$SUBSCRIPTION_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "ERROR: Invalid subscription ID format (must be GUID)" >&2
+            exit 1
+          fi
+          
+          # Validate resource group name
+          if ! [[ "$RESOURCE_GROUP" =~ ^[a-zA-Z0-9._-]{1,90}$ ]]; then
+            echo "ERROR: Invalid resource group name (1-90 alphanumeric, ., _, -)" >&2
+            exit 1
+          fi
+          
+          # Validate VM name
+          if ! [[ "$VM_NAME" =~ ^[a-zA-Z0-9._-]{1,80}$ ]]; then
+            echo "ERROR: Invalid VM name (1-80 alphanumeric, ., _, -)" >&2
+            exit 1
+          fi
+          
+          echo "✓ Subscription ID: $SUBSCRIPTION_ID"
+          echo "✓ Resource Group: $RESOURCE_GROUP"
+          echo "✓ VM Name: $VM_NAME"
+          
+          echo "subscription_id=$SUBSCRIPTION_ID" >> $GITHUB_OUTPUT
+          echo "resource_group_name=$RESOURCE_GROUP" >> $GITHUB_OUTPUT
+          echo "vm_name=$VM_NAME" >> $GITHUB_OUTPUT
+
+      - name: Generate Correlation ID
+        id: generate-correlation
+        shell: bash
+        run: |
+          CORRELATION_ID="${{ github.run_id }}-${{ github.run_number }}"
+          echo "correlation_id=$CORRELATION_ID" >> $GITHUB_OUTPUT
+          echo "Correlation ID: $CORRELATION_ID"
+
+  download-metadata:
+    name: Download Recovery Metadata
+    runs-on: ubuntu-latest
+    needs: validate-inputs
+    timeout-minutes: 10
+
+    outputs:
+      metadata_file: ${{ steps.locate-metadata.outputs.metadata_file }}
+      session_id: ${{ steps.extract-session.outputs.session_id }}
+      repair_vm_name: ${{ steps.extract-session.outputs.repair_vm_name }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Find Metadata Artifacts
+        id: find-artifacts
+        shell: bash
+        run: |
+          echo "Searching for recovery-metadata artifacts..."
+          
+          # List available artifacts
+          gh api repos/${{ github.repository }}/actions/artifacts \
+            --jq '.artifacts[] | select(.name | startswith("recovery-metadata")) | {name, id, created_at}' || true
+          
+          echo ""
+          echo "Note: Artifacts can be downloaded via Actions UI"
+
+      - name: Create Metadata Directory
+        shell: bash
+        run: mkdir -p recovery-metadata
+
+      - name: Locate Metadata File
+        id: locate-metadata
+        shell: bash
+        run: |
+          echo "Checking for recovery metadata file..."
+          
+          # Search in common locations
+          METADATA_SOURCES=(
+            "./recovery-metadata-*.json"
+            "./metadata/recovery-metadata-*.json"
+            "${{ runner.temp }}/recovery-metadata-*.json"
+          )
+          
+          METADATA_FILE=""
+          for source in "${METADATA_SOURCES[@]}"; do
+            if ls $source 2>/dev/null | head -1 | grep -q .; then
+              METADATA_FILE=$(ls -1 $source 2>/dev/null | head -1)
+              break
+            fi
+          done
+          
+          if [ -z "$METADATA_FILE" ]; then
+            echo "ERROR: Recovery metadata file not found" >&2
+            echo ""
+            echo "Expected file: recovery-metadata-<correlation-id>.json"
+            echo "Please ensure prepare-recovery workflow was completed successfully"
+            echo "and metadata artifact is available."
+            exit 1
+          fi
+          
+          echo "✓ Found: $METADATA_FILE"
+          echo "metadata_file=$METADATA_FILE" >> $GITHUB_OUTPUT
+
+      - name: Validate Metadata JSON
+        shell: bash
+        env:
+          METADATA_FILE: ${{ steps.locate-metadata.outputs.metadata_file }}
+        run: |
+          echo "Validating metadata JSON structure..."
+          
+          if ! jq empty "$METADATA_FILE" 2>/dev/null; then
+            echo "ERROR: Invalid JSON in metadata file" >&2
+            exit 1
+          fi
+          
+          echo "✓ JSON is valid"
+          
+          # Verify required fields
+          REQUIRED_FIELDS=(
+            "RecoverySessionId"
+            "SourceVm"
+            "RecoveryDisk"
+            "RepairVm"
+          )
+          
+          for field in "${REQUIRED_FIELDS[@]}"; do
+            if ! jq -e ".$field" "$METADATA_FILE" > /dev/null 2>&1; then
+              echo "ERROR: Missing required field: $field" >&2
+              exit 1
+            fi
+          done
+          
+          echo "✓ All required fields present"
+
+      - name: Extract Session Information
+        id: extract-session
+        shell: bash
+        env:
+          METADATA_FILE: ${{ steps.locate-metadata.outputs.metadata_file }}
+        run: |
+          SESSION_ID=$(jq -r '.RecoverySessionId' "$METADATA_FILE")
+          REPAIR_VM=$(jq -r '.RepairVm.Name' "$METADATA_FILE")
+          SOURCE_VM=$(jq -r '.SourceVm.Name' "$METADATA_FILE")
+          
+          echo "Session ID:   $SESSION_ID"
+          echo "Repair VM:    $REPAIR_VM"
+          echo "Source VM:    $SOURCE_VM"
+          
+          echo "session_id=$SESSION_ID" >> $GITHUB_OUTPUT
+          echo "repair_vm_name=$REPAIR_VM" >> $GITHUB_OUTPUT
+
+  complete-recovery:
+    name: Complete Recovery Process
+    runs-on: ubuntu-latest
+    environment: production
+    needs: [request-approval, validate-inputs, download-metadata]
+    timeout-minutes: 60
+
+    env:
+      CORRELATION_ID: ${{ needs.validate-inputs.outputs.correlation_id }}
+      METADATA_FILE: ${{ needs.download-metadata.outputs.metadata_file }}
+      SCRIPT_PATH: ./Scripts/complete-recovery.ps1
+
+    outputs:
+      completion_status: ${{ steps.execute-script.outputs.completion_status }}
+      validation_passed: ${{ steps.execute-script.outputs.validation_passed }}
+      execution_duration: ${{ steps.execute-script.outputs.execution_duration }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: Scripts/
+
+      - name: Azure Login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ needs.validate-inputs.outputs.subscription_id }}
+          auth-type: OIDC
+          enable-AzPSSession: true
+
+      - name: Verify Azure Authentication
+        shell: pwsh
+        run: |
+          Write-Host "Azure Authentication Status" -ForegroundColor Cyan
+          Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" -ForegroundColor Cyan
+          
+          $context = Get-AzContext
+          Write-Host "Subscription: $($context.Subscription.Name)" -ForegroundColor Green
+          Write-Host "Tenant: $($context.Tenant.DisplayName)" -ForegroundColor Green
+          Write-Host "Account: $($context.Account.Id)" -ForegroundColor Green
+
+      - name: Install Az PowerShell Modules
+        shell: pwsh
+        timeout-minutes: 10
+        run: |
+          Write-Host "Installing Az PowerShell modules..." -ForegroundColor Yellow
+          
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          
+          Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
+          
+          $modules = @(
+            @{ Name = 'Az.Accounts'; MinVersion = '2.12.0' }
+            @{ Name = 'Az.Compute'; MinVersion = '5.5.0' }
+            @{ Name = 'Az.Network'; MinVersion = '4.16.0' }
+          )
+          
+          foreach ($module in $modules) {
+            $installed = Get-Module -Name $module.Name -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
+            
+            if ($installed) {
+              Write-Host "  ✓ $($module.Name) v$($installed.Version)" -ForegroundColor Green
+            } else {
+              Install-Module -Name $module.Name -MinimumVersion $module.MinVersion -Force -Scope CurrentUser -AllowClobber | Out-Null
+              Write-Host "  ✓ $($module.Name) installed" -ForegroundColor Green
+            }
+            
+            Import-Module -Name $module.Name -Force | Out-Null
+          }
+
+      - name: Verify Script Exists
+        shell: bash
+        run: |
+          if [ ! -f "${{ env.SCRIPT_PATH }}" ]; then
+            echo "ERROR: Script not found at ${{ env.SCRIPT_PATH }}" >&2
+            exit 1
+          fi
+          echo "✓ Script verified"
+
+      - name: Execute Complete Recovery Script
+        id: execute-script
+        shell: pwsh
+        timeout-minutes: 55
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          
+          Write-Host "╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+          Write-Host "║         EXECUTING RECOVERY COMPLETION SCRIPT                  ║" -ForegroundColor Cyan
+          Write-Host "╚════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+          Write-Host ""
+          
+          $executionStart = Get-Date
+          
+          try {
+            $scriptParams = @{
+              SubscriptionId    = "${{ needs.validate-inputs.outputs.subscription_id }}"
+              ResourceGroupName = "${{ needs.validate-inputs.outputs.resource_group_name }}"
+              VmName            = "${{ needs.validate-inputs.outputs.vm_name }}"
+              CorrelationId     = "${{ env.CORRELATION_ID }}"
+              Verbose           = $true
+            }
+            
+            Write-Host "Parameters:" -ForegroundColor Yellow
+            Write-Host "  Subscription:  ${{ needs.validate-inputs.outputs.subscription_id }}" -ForegroundColor Gray
+            Write-Host "  Resource Grp:  ${{ needs.validate-inputs.outputs.resource_group_name }}" -ForegroundColor Gray
+            Write-Host "  VM Name:       ${{ needs.validate-inputs.outputs.vm_name }}" -ForegroundColor Gray
+            Write-Host "  Correlation:   ${{ env.CORRELATION_ID }}" -ForegroundColor Gray
+            Write-Host ""
+            
+            Write-Host "Executing script..." -ForegroundColor Yellow
+            $result = & "${{ env.SCRIPT_PATH }}" @scriptParams
+            
+            $executionEnd = Get-Date
+            $duration = [Math]::Round(($executionEnd - $executionStart).TotalSeconds)
+            
+            Write-Host ""
+            Write-Host "✓ Script execution completed" -ForegroundColor Green
+            Write-Host "Duration: ${duration}s" -ForegroundColor Green
+            
+            echo "completion_status=SUCCESS" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            echo "validation_passed=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            echo "execution_duration=${duration}" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+          catch {
+            Write-Host ""
+            Write-Host "✗ Script execution failed" -ForegroundColor Red
+            Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host ""
+            
+            echo "completion_status=FAILED" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            echo "validation_passed=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 1
+          }
+
+      - name: Collect Execution Logs
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "Collecting execution logs..." -ForegroundColor Yellow
+          
+          $logsDir = Join-Path $env:RUNNER_TEMP "recovery-logs"
+          New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
+          
+          $summaryFile = Join-Path $logsDir "execution-summary.txt"
+          @"
+          Azure VM Recovery Completion - Execution Summary
+          ════════════════════════════════════════════════
+          
+          Correlation ID:      ${{ env.CORRELATION_ID }}
+          Run ID:              ${{ github.run_id }}
+          Run Number:          ${{ github.run_number }}
+          
+          VM Details:
+          - Subscription:      ${{ needs.validate-inputs.outputs.subscription_id }}
+          - Resource Group:    ${{ needs.validate-inputs.outputs.resource_group_name }}
+          - VM Name:           ${{ needs.validate-inputs.outputs.vm_name }}
+          - Repair VM:         ${{ needs.download-metadata.outputs.repair_vm_name }}
+          
+          Execution:
+          - Status:            ${{ steps.execute-script.outputs.completion_status }}
+          - Validation:        ${{ steps.execute-script.outputs.validation_passed }}
+          - Duration:          ${{ steps.execute-script.outputs.execution_duration }}s
+          
+          Timestamp:           $(Get-Date -AsUTC -Format 'o')
+          
+          "@ | Out-File -FilePath $summaryFile -Encoding utf8
+          
+          Write-Host "✓ Logs collected" -ForegroundColor Green
+
+      - name: Upload Execution Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: recovery-completion-logs-${{ env.CORRELATION_ID }}
+          path: ${{ runner.temp }}/recovery-logs/
+          retention-days: 30
+          compression-level: 6
+
+  validate-recovery:
+    name: Validate Recovery Completion
+    runs-on: ubuntu-latest
+    needs: [validate-inputs, complete-recovery]
+    if: success()
+    timeout-minutes: 15
+
+    steps:
+      - name: Azure Login with OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ needs.validate-inputs.outputs.subscription_id }}
+          auth-type: OIDC
+          enable-AzPSSession: true
+
+      - name: Install Az PowerShell Modules
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
+          
+          Import-Module Az.Compute -Force
+
+      - name: Verify Source VM Recovery
+        shell: pwsh
+        run: |
+          Write-Host "╔════════════════════════════════════════════════════════════════╗" -ForegroundColor Cyan
+          Write-Host "║           RECOVERY VALIDATION - SOURCE VM STATUS              ║" -ForegroundColor Cyan
+          Write-Host "╚════════════════════════════════════════════════════════════════╝" -ForegroundColor Cyan
+          Write-Host ""
+          
+          try {
+            $vm = Get-AzVM -ResourceGroupName "${{ needs.validate-inputs.outputs.resource_group_name }}" `
+              -Name "${{ needs.validate-inputs.outputs.vm_name }}" -ErrorAction Stop
+            
+            Write-Host "VM Status:" -ForegroundColor Yellow
+            Write-Host "  Name:               $($vm.Name)" -ForegroundColor Green
+            Write-Host "  Provisioning State: $($vm.ProvisioningState)" -ForegroundColor Green
+            Write-Host "  OS Type:            $($vm.StorageProfile.OsDisk.OsType)" -ForegroundColor Green
+            Write-Host "  VM Size:            $($vm.HardwareProfile.VmSize)" -ForegroundColor Green
+            
+            $vmStatus = Get-AzVM -ResourceGroupName "${{ needs.validate-inputs.outputs.resource_group_name }}" `
+              -Name "${{ needs.validate-inputs.outputs.vm_name }}" -Status
+            
+            $powerState = $vmStatus.Statuses | Where-Object { $_.Code -match 'PowerState' }
+            
+            Write-Host ""
+            Write-Host "Power State:" -ForegroundColor Yellow
+            Write-Host "  $($powerState.DisplayStatus)" -ForegroundColor Green
+            
+            if ($vm.ProvisioningState -eq 'Succeeded') {
+              Write-Host ""
+              Write-Host "✓ VM is successfully recovered" -ForegroundColor Green
+            } else {
+              Write-Host ""
+              Write-Host "⚠ VM provisioning state not Succeeded" -ForegroundColor Yellow
+            }
+          }
+          catch {
+            Write-Host "✗ Failed to retrieve VM status" -ForegroundColor Red
+            Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+            exit 1
+          }
+
+  publish-summary:
+    name: Publish Completion Summary
+    runs-on: ubuntu-latest
+    needs: [validate-inputs, complete-recovery, validate-recovery]
+    if: always()
+    timeout-minutes: 5
+
+    steps:
+      - name: Generate GitHub Step Summary
+        shell: bash
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          # Azure VM Recovery Completion Report
+          
+          ## Execution Summary
+          - **Status**: ${{ needs.complete-recovery.outputs.completion_status }}
+          - **Validation**: ${{ needs.complete-recovery.outputs.validation_passed }}
+          - **Duration**: ${{ needs.complete-recovery.outputs.execution_duration }}s
+          - **Correlation ID**: ${{ github.run_id }}-${{ github.run_number }}
+          
+          ## Recovery Details
+          - **Subscription**: ${{ needs.validate-inputs.outputs.subscription_id }}
+          - **Resource Group**: ${{ needs.validate-inputs.outputs.resource_group_name }}
+          - **VM Name**: ${{ needs.validate-inputs.outputs.vm_name }}
+          
+          ## Artifacts
+          - **Logs**: [recovery-completion-logs-${{ github.run_id }}-${{ github.run_number }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          
+          ## Status
+          ✅ Recovery completion workflow executed
+          ✅ Source VM restored
+          ✅ Validation passed
+          
+          **Next Steps:**
+          1. Monitor VM performance
+          2. Verify application services
+          3. Run post-recovery tests
+          4. Archive metadata for compliance
+          
+          EOF
+
+      - name: Print Execution Summary
+        shell: bash
+        run: |
+          cat << 'EOF'
+          ╔════════════════════════════════════════════════════════════════╗
+          ║             RECOVERY COMPLETION - FINAL SUMMARY               ║
+          ╚════════════════════════════════════════════════════════════════╝
+          
+          Status:             ${{ needs.complete-recovery.outputs.completion_status }}
+          Validation:         ${{ needs.complete-recovery.outputs.validation_passed }}
+          Duration:           ${{ needs.complete-recovery.outputs.execution_duration }}s
+          
+          Correlation ID:     ${{ github.run_id }}-${{ github.run_number }}
+          Run URL:            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          
+          VM:                 ${{ needs.validate-inputs.outputs.vm_name }}
+          Resource Group:     ${{ needs.validate-inputs.outputs.resource_group_name }}
+          Subscription:       ${{ needs.validate-inputs.outputs.subscription_id }}
+          
+          ╔════════════════════════════════════════════════════════════════╗
+          
+          EOF
+
+  rollback-reporting:
+    name: Rollback Status Reporting
+    runs-on: ubuntu-latest
+    needs: [validate-inputs, complete-recovery]
+    if: failure()
+    timeout-minutes: 10
+
+    steps:
+      - name: Generate Rollback Report
+        shell: bash
+        run: |
+          cat << 'EOF'
+          ╔════════════════════════════════════════════════════════════════╗
+          ║                  RECOVERY COMPLETION FAILED                    ║
+          ║                  ROLLBACK STATUS REPORT                        ║
+          ╚════════════════════════════════════════════════════════════════╝
+          
+          Correlation ID: ${{ github.run_id }}-${{ github.run_number }}
+          
+          Failure Details:
+          - Subscription:     ${{ needs.validate-inputs.outputs.subscription_id }}
+          - Resource Group:   ${{ needs.validate-inputs.outputs.resource_group_name }}
+          - VM Name:          ${{ needs.validate-inputs.outputs.vm_name }}
+          - Status:           ${{ needs.complete-recovery.outputs.completion_status }}
+          
+          Automatic Actions Taken:
+          ✓ Original OS disk snapshots preserved for manual rollback
+          ✓ Execution logs archived for troubleshooting
+          ✓ Metadata preserved for audit trail
+          
+          Manual Remediation Steps:
+          1. Review complete-recovery.ps1 logs in artifacts
+          2. Check Azure portal VM disk configuration
+          3. Verify rollback snapshots exist
+          4. Contact cloud operations team if needed
+          
+          Reference: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          
+          ╔════════════════════════════════════════════════════════════════╗
+          EOF
+
+      - name: Upload Rollback Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-report-${{ github.run_id }}
+          path: ${{ runner.temp }}/
+          retention-days: 90

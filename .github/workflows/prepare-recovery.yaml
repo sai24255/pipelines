@@ -1,0 +1,566 @@
+name: Azure VM OS Disk Recovery Preparation
+
+env:
+  AZURE_ENVIRONMENT: AzurePublicCloud
+  PS_MODULE_CACHE_PATH: ~/.powershell/modules
+
+on:
+  workflow_dispatch:
+    inputs:
+      subscriptionId:
+        description: 'Azure Subscription ID'
+        required: true
+        type: string
+      resourceGroupName:
+        description: 'Azure Resource Group Name'
+        required: true
+        type: string
+      vmName:
+        description: 'Source VM Name'
+        required: true
+        type: string
+      location:
+        description: 'Azure Region (e.g., eastus, westus2)'
+        required: true
+        type: string
+      repairVmAdminUsername:
+        description: 'Repair VM Administrator Username'
+        required: true
+        type: string
+      repairVmAdminPassword:
+        description: 'Repair VM Administrator Password'
+        required: true
+        type: string
+      environment:
+        description: 'GitHub Environment (for secrets)'
+        required: false
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+          - development
+
+permissions:
+  id-token: write
+  contents: read
+  artifacts: write
+
+concurrency:
+  group: recovery-${{ github.workflow }}-${{ inputs.vmName }}
+  cancel-in-progress: false
+
+jobs:
+  prepare-recovery:
+    name: Prepare Azure VM Recovery
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 30
+
+    env:
+      SCRIPT_PATH: ./Scripts/prepare-recovery.ps1
+      METADATA_ARTIFACT_NAME: recovery-metadata
+      LOGS_ARTIFACT_NAME: recovery-logs
+      CORRELATION_ID: ${{ github.run_id }}-${{ github.run_number }}
+
+    outputs:
+      correlation_id: ${{ steps.prepare.outputs.correlation_id }}
+      repair_vm_name: ${{ steps.prepare.outputs.repair_vm_name }}
+      repair_vm_ip: ${{ steps.prepare.outputs.repair_vm_ip }}
+      metadata_file: ${{ steps.prepare.outputs.metadata_file }}
+      execution_status: ${{ steps.prepare.outputs.execution_status }}
+
+    steps:
+      - name: Checkout Repository
+        id: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            Scripts/
+            .github/
+
+      - name: Validate Input Parameters
+        id: validate-inputs
+        shell: bash
+        run: |
+          echo "Validating input parameters..."
+          
+          # Validate subscription ID format
+          if ! [[ "${{ inputs.subscriptionId }}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "ERROR: Invalid subscription ID format" >&2
+            exit 1
+          fi
+          
+          # Validate resource group name
+          if ! [[ "${{ inputs.resourceGroupName }}" =~ ^[a-zA-Z0-9._-]{1,90}$ ]]; then
+            echo "ERROR: Invalid resource group name format" >&2
+            exit 1
+          fi
+          
+          # Validate VM name
+          if ! [[ "${{ inputs.vmName }}" =~ ^[a-zA-Z0-9._-]{1,80}$ ]]; then
+            echo "ERROR: Invalid VM name format" >&2
+            exit 1
+          fi
+          
+          # Validate location
+          if [[ -z "${{ inputs.location }}" ]]; then
+            echo "ERROR: Location cannot be empty" >&2
+            exit 1
+          fi
+          
+          # Validate username
+          if [[ -z "${{ inputs.repairVmAdminUsername }}" ]] || [[ ${#inputs.repairVmAdminUsername} -gt 20 ]]; then
+            echo "ERROR: Invalid administrator username" >&2
+            exit 1
+          fi
+          
+          # Validate password length
+          if [[ ${#inputs.repairVmAdminPassword} -lt 12 ]]; then
+            echo "ERROR: Password must be at least 12 characters" >&2
+            exit 1
+          fi
+          
+          echo "✓ All input parameters validated successfully"
+          echo "subscription_id=${{ inputs.subscriptionId }}" >> $GITHUB_OUTPUT
+          echo "resource_group_name=${{ inputs.resourceGroupName }}" >> $GITHUB_OUTPUT
+          echo "vm_name=${{ inputs.vmName }}" >> $GITHUB_OUTPUT
+          echo "location=${{ inputs.location }}" >> $GITHUB_OUTPUT
+          echo "admin_username=${{ inputs.repairVmAdminUsername }}" >> $GITHUB_OUTPUT
+
+      - name: Azure Login with OIDC
+        id: azure-login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ inputs.subscriptionId }}
+          auth-type: OIDC
+          enable-AzPSSession: true
+          allow-no-subscriptions: false
+
+      - name: Log Azure Authentication Status
+        id: verify-auth
+        shell: pwsh
+        run: |
+          Write-Host "═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+          Write-Host "Azure Authentication Status" -ForegroundColor Cyan
+          Write-Host "═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+          
+          $context = Get-AzContext
+          Write-Host "Subscription: $($context.Subscription.Name)" -ForegroundColor Green
+          Write-Host "Subscription ID: $($context.Subscription.Id)" -ForegroundColor Green
+          Write-Host "Tenant: $($context.Tenant.DisplayName)" -ForegroundColor Green
+          Write-Host "Account: $($context.Account.Id)" -ForegroundColor Green
+          Write-Host "Environment: $($context.Environment.Name)" -ForegroundColor Green
+          
+          Write-Host ""
+          Write-Host "Checking required Az modules..." -ForegroundColor Yellow
+          
+          $requiredModules = @('Az.Compute', 'Az.Network', 'Az.Accounts')
+          foreach ($module in $requiredModules) {
+            $installed = Get-Module -Name $module -ListAvailable
+            if ($installed) {
+              Write-Host "  ✓ $module v$($installed.Version)" -ForegroundColor Green
+            } else {
+              Write-Host "  ✗ $module NOT FOUND" -ForegroundColor Red
+            }
+          }
+          
+          Write-Host ""
+          Write-Host "═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+
+      - name: Install/Update Az PowerShell Modules
+        id: install-modules
+        shell: pwsh
+        run: |
+          Write-Host "Installing/Updating Az PowerShell modules..." -ForegroundColor Yellow
+          
+          $ErrorActionPreference = 'Stop'
+          
+          # Update NuGet provider
+          Write-Host "Updating NuGet provider..." -ForegroundColor Gray
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Install-PackageProvider -Name NuGet -Force -Scope CurrentUser | Out-Null
+          
+          # Define required modules with minimum versions
+          $modules = @(
+            @{ Name = 'Az.Accounts'; MinVersion = '2.12.0' }
+            @{ Name = 'Az.Compute'; MinVersion = '5.5.0' }
+            @{ Name = 'Az.Network'; MinVersion = '4.16.0' }
+          )
+          
+          foreach ($module in $modules) {
+            Write-Host "Processing module: $($module.Name)..." -ForegroundColor Gray
+            
+            $installed = Get-Module -Name $module.Name -ListAvailable | Sort-Object Version -Descending | Select-Object -First 1
+            
+            if ($installed) {
+              Write-Host "  Installed version: $($installed.Version)" -ForegroundColor Green
+            } else {
+              Write-Host "  Installing $($module.Name)..." -ForegroundColor Yellow
+              Install-Module -Name $module.Name -MinimumVersion $module.MinVersion -Force -Scope CurrentUser -AllowClobber | Out-Null
+              Write-Host "  ✓ Installed successfully" -ForegroundColor Green
+            }
+          }
+          
+          # Import modules
+          Write-Host ""
+          Write-Host "Importing modules..." -ForegroundColor Yellow
+          foreach ($module in $modules) {
+            Import-Module -Name $module.Name -Force | Out-Null
+            Write-Host "  ✓ Imported $($module.Name)" -ForegroundColor Green
+          }
+          
+          Write-Host ""
+          Write-Host "Module installation completed successfully" -ForegroundColor Green
+
+      - name: Verify Script Exists
+        id: verify-script
+        shell: bash
+        run: |
+          if [ ! -f "${{ env.SCRIPT_PATH }}" ]; then
+            echo "ERROR: Script not found at ${{ env.SCRIPT_PATH }}" >&2
+            exit 1
+          fi
+          
+          echo "✓ Script found: ${{ env.SCRIPT_PATH }}"
+          echo "Script size: $(stat -f%z '${{ env.SCRIPT_PATH }}' 2>/dev/null || stat -c%s '${{ env.SCRIPT_PATH }}')"
+          
+          # Check script validity
+          pwsh -NoProfile -Command "
+            \$script = Get-Content -Path '${{ env.SCRIPT_PATH }}' -Raw
+            if (\$script -match '#Requires -Version 7.0') {
+              Write-Host '✓ PowerShell 7.0+ compatible'
+              exit 0
+            } else {
+              Write-Host 'WARNING: PowerShell version requirement not found'
+              exit 1
+            }
+          " || true
+
+      - name: Execute Recovery Preparation Script
+        id: prepare
+        shell: pwsh
+        timeout-minutes: 25
+        env:
+          SCRIPT_PASSWORD: ${{ inputs.repairVmAdminPassword }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          
+          Write-Host "═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+          Write-Host "Executing Azure VM Recovery Preparation" -ForegroundColor Cyan
+          Write-Host "═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+          Write-Host ""
+          
+          # Start execution timer
+          $executionStart = Get-Date
+          
+          try {
+            # Convert password to SecureString
+            $securePassword = ConvertTo-SecureString -String $env:SCRIPT_PASSWORD -AsPlainText -Force
+            
+            # Execute script with parameters
+            $scriptParams = @{
+              SubscriptionId          = "${{ inputs.subscriptionId }}"
+              ResourceGroupName       = "${{ inputs.resourceGroupName }}"
+              VmName                  = "${{ inputs.vmName }}"
+              Location                = "${{ inputs.location }}"
+              RepairVmAdminUsername   = "${{ inputs.repairVmAdminUsername }}"
+              RepairVmAdminPassword   = $securePassword
+              CorrelationId           = "${{ env.CORRELATION_ID }}"
+              Verbose                 = $true
+            }
+            
+            Write-Host "Script Parameters:" -ForegroundColor Yellow
+            Write-Host "  Subscription ID:    ${{ inputs.subscriptionId }}" -ForegroundColor Gray
+            Write-Host "  Resource Group:     ${{ inputs.resourceGroupName }}" -ForegroundColor Gray
+            Write-Host "  VM Name:            ${{ inputs.vmName }}" -ForegroundColor Gray
+            Write-Host "  Location:           ${{ inputs.location }}" -ForegroundColor Gray
+            Write-Host "  Admin Username:     ${{ inputs.repairVmAdminUsername }}" -ForegroundColor Gray
+            Write-Host "  Correlation ID:     ${{ env.CORRELATION_ID }}" -ForegroundColor Gray
+            Write-Host ""
+            
+            Write-Host "Starting script execution..." -ForegroundColor Yellow
+            Write-Host ""
+            
+            # Execute script and capture output
+            $result = & "${{ env.SCRIPT_PATH }}" @scriptParams
+            
+            $executionEnd = Get-Date
+            $duration = ($executionEnd - $executionStart).TotalSeconds
+            
+            Write-Host ""
+            Write-Host "Script execution completed successfully" -ForegroundColor Green
+            Write-Host "Duration: $([Math]::Round($duration))s" -ForegroundColor Green
+            
+            # Handle result (metadata file path)
+            if ($result) {
+              Write-Host "Metadata file: $result" -ForegroundColor Green
+              
+              # Set outputs
+              echo "correlation_id=${{ env.CORRELATION_ID }}" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              echo "execution_status=SUCCESS" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              echo "metadata_file=$result" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              
+              # Extract repair VM details from metadata
+              if (Test-Path $result) {
+                $metadata = Get-Content -Path $result | ConvertFrom-Json
+                
+                echo "repair_vm_name=$($metadata.RepairVm.Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+                echo "repair_vm_ip=$($metadata.RepairVm.PublicIpAddress)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+                
+                Write-Host ""
+                Write-Host "Repair VM Details:" -ForegroundColor Cyan
+                Write-Host "  Name:       $($metadata.RepairVm.Name)" -ForegroundColor Green
+                Write-Host "  Public IP:  $($metadata.RepairVm.PublicIpAddress)" -ForegroundColor Green
+              }
+            }
+            
+            Write-Host ""
+            Write-Host "═══════════════════════════════════════════════════════════════════" -ForegroundColor Cyan
+          }
+          catch {
+            Write-Host ""
+            Write-Host "ERROR: Script execution failed" -ForegroundColor Red
+            Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host ""
+            Write-Host "Stack Trace:" -ForegroundColor Red
+            Write-Host $_.ScriptStackTrace -ForegroundColor Red
+            
+            echo "execution_status=FAILED" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+            exit 1
+          }
+          finally {
+            # Clear sensitive environment variable
+            $env:SCRIPT_PASSWORD = $null
+          }
+
+      - name: Locate and Validate Metadata File
+        id: validate-metadata
+        shell: bash
+        if: success()
+        run: |
+          echo "Locating metadata file..."
+          
+          # Search for metadata file
+          METADATA_FILE=$(find . -name "recovery-metadata-*.json" -type f | head -1)
+          
+          if [ -z "$METADATA_FILE" ]; then
+            echo "ERROR: Metadata file not found" >&2
+            exit 1
+          fi
+          
+          echo "Found metadata file: $METADATA_FILE"
+          echo "File size: $(stat -f%z "$METADATA_FILE" 2>/dev/null || stat -c%s "$METADATA_FILE")"
+          
+          # Validate JSON
+          if ! jq empty "$METADATA_FILE" 2>/dev/null; then
+            echo "ERROR: Metadata file contains invalid JSON" >&2
+            exit 1
+          fi
+          
+          echo "✓ Metadata file is valid JSON"
+          
+          # Extract key information
+          echo ""
+          echo "Metadata Summary:"
+          jq -r '
+            "  Session ID: \(.RecoverySessionId)",
+            "  Source VM: \(.SourceVm.Name)",
+            "  Repair VM: \(.RepairVm.Name)",
+            "  Public IP: \(.RepairVm.PublicIpAddress)",
+            "  OS Type: \(.SourceVm.OsType)"
+          ' "$METADATA_FILE"
+          
+          # Set output
+          echo "metadata_file=$METADATA_FILE" >> $GITHUB_OUTPUT
+
+      - name: Collect Execution Logs
+        id: collect-logs
+        shell: pwsh
+        if: always()
+        run: |
+          Write-Host "Collecting execution logs..." -ForegroundColor Yellow
+          
+          $logsDir = Join-Path $PWD "logs"
+          New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
+          
+          # PowerShell history (if available)
+          $historyFile = Join-Path $logsDir "powershell-history.txt"
+          Get-History | Format-Table -AutoSize | Out-File -FilePath $historyFile -Encoding utf8
+          
+          # GitHub Actions environment info
+          $envFile = Join-Path $logsDir "execution-environment.txt"
+          @"
+          GitHub Workflow Execution Information
+          =====================================
+          Run ID:         ${{ github.run_id }}
+          Run Number:     ${{ github.run_number }}
+          Run Attempt:    ${{ github.run_attempt }}
+          Actor:          ${{ github.actor }}
+          Ref:            ${{ github.ref }}
+          SHA:            ${{ github.sha }}
+          Correlation ID: ${{ env.CORRELATION_ID }}
+          
+          Execution Status:  ${{ steps.prepare.outputs.execution_status }}
+          
+          Timestamps:
+          - Job Started:     ${{ job.status == 'in_progress' && 'In Progress' || 'Completed' }}
+          
+          Environment Details:
+          OS: Ubuntu Latest
+          PowerShell: 7.x
+          
+          "@ | Out-File -FilePath $envFile -Encoding utf8
+          
+          Write-Host "✓ Logs collected to: $logsDir" -ForegroundColor Green
+
+      - name: Upload Metadata Artifact
+        id: upload-metadata
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: ${{ env.METADATA_ARTIFACT_NAME }}-${{ env.CORRELATION_ID }}
+          path: recovery-metadata-*.json
+          retention-days: 90
+          if-no-files-found: error
+          compression-level: 6
+
+      - name: Upload Logs Artifact
+        id: upload-logs
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ env.LOGS_ARTIFACT_NAME }}-${{ env.CORRELATION_ID }}
+          path: logs/
+          retention-days: 30
+          if-no-files-found: ignore
+          compression-level: 6
+
+      - name: Generate Workflow Summary
+        id: summary
+        if: always()
+        shell: pwsh
+        run: |
+          $summaryContent = @"
+          # Azure VM Recovery Preparation Summary
+          
+          ## Execution Details
+          - **Correlation ID**: ${{ env.CORRELATION_ID }}
+          - **Status**: ${{ steps.prepare.outputs.execution_status }}
+          - **Job Status**: ${{ job.status }}
+          
+          ## Parameters
+          - **Subscription**: ${{ inputs.subscriptionId }}
+          - **Resource Group**: ${{ inputs.resourceGroupName }}
+          - **VM Name**: ${{ inputs.vmName }}
+          - **Location**: ${{ inputs.location }}
+          
+          ## Repair VM Details
+          - **Name**: ${{ steps.prepare.outputs.repair_vm_name }}
+          - **Public IP**: ${{ steps.prepare.outputs.repair_vm_ip }}
+          
+          ## Artifacts
+          - **Metadata**: [recovery-metadata-${{ env.CORRELATION_ID }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - **Logs**: [recovery-logs-${{ env.CORRELATION_ID }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          
+          ## Next Steps
+          1. Download the metadata artifact
+          2. Perform recovery operations on the repair VM
+          3. Execute the complete-recovery workflow when ready
+          4. Reference Correlation ID for tracking: **${{ env.CORRELATION_ID }}**
+          
+          ---
+          Generated at: $([DateTime]::UtcNow:o)
+          
+          "@
+          
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summaryContent
+
+      - name: Output Workflow Summary
+        id: output-summary
+        shell: bash
+        if: success()
+        run: |
+          cat << 'EOF'
+          ═══════════════════════════════════════════════════════════════════
+          WORKFLOW EXECUTION SUMMARY
+          ═══════════════════════════════════════════════════════════════════
+          
+          Status:             ${{ steps.prepare.outputs.execution_status }}
+          Correlation ID:     ${{ env.CORRELATION_ID }}
+          
+          Source VM:          ${{ inputs.vmName }}
+          Resource Group:     ${{ inputs.resourceGroupName }}
+          Location:           ${{ inputs.location }}
+          
+          Repair VM:          ${{ steps.prepare.outputs.repair_vm_name }}
+          Public IP:          ${{ steps.prepare.outputs.repair_vm_ip }}
+          
+          Artifacts:
+            - Metadata:       recovery-metadata-${{ env.CORRELATION_ID }}
+            - Logs:           recovery-logs-${{ env.CORRELATION_ID }}
+          
+          ═══════════════════════════════════════════════════════════════════
+          EOF
+
+      - name: Handle Workflow Failure
+        id: handle-failure
+        if: failure()
+        shell: bash
+        run: |
+          cat << 'EOF'
+          ═══════════════════════════════════════════════════════════════════
+          WORKFLOW EXECUTION FAILED
+          ═══════════════════════════════════════════════════════════════════
+          
+          Correlation ID: ${{ env.CORRELATION_ID }}
+          
+          Failure Details:
+            - Step Status: ${{ steps.prepare.outcome }}
+            - Job Status: ${{ job.status }}
+          
+          Review the following for troubleshooting:
+            1. Check Azure Login step (OIDC authentication)
+            2. Review PowerShell module installation
+            3. Validate input parameters
+            4. Check script logs in artifacts
+            5. Verify Azure RBAC permissions
+          
+          Reference the Correlation ID in support tickets or error reports.
+          
+          ═══════════════════════════════════════════════════════════════════
+          EOF
+          exit 1
+
+  notify-completion:
+    name: Notify Completion
+    runs-on: ubuntu-latest
+    needs: prepare-recovery
+    if: always()
+    steps:
+      - name: Generate Completion Notification
+        shell: bash
+        run: |
+          CORRELATION_ID="${{ needs.prepare-recovery.outputs.correlation_id }}"
+          STATUS="${{ needs.prepare-recovery.outputs.execution_status }}"
+          
+          cat << EOF
+          
+          ═══════════════════════════════════════════════════════════════════
+          RECOVERY PREPARATION WORKFLOW COMPLETED
+          ═══════════════════════════════════════════════════════════════════
+          
+          Correlation ID: $CORRELATION_ID
+          Final Status:   $STATUS
+          
+          Run Details:
+            - Run ID:     ${{ github.run_id }}
+            - Run URL:    https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          
+          ═══════════════════════════════════════════════════════════════════
+          
+          EOF
