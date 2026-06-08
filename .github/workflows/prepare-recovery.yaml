@@ -44,7 +44,6 @@ on:
 permissions:
   id-token: write
   contents: read
-  artifacts: write
 
 concurrency:
   group: recovery-${{ github.workflow }}-${{ inputs.vmName }}
